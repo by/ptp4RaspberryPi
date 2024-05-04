@@ -1,16 +1,20 @@
 > [!WARNING] 
 > This is optional! Proceed with caution and at your own risk!
 
-While there is quite some information available how to properly set up PTP on your Rapsberry device, e.g.,
+While there is quite some information available how to properly set up PTP on your Raspberry device, e.g.,
  - https://github.com/tiagofreire-pt/rpi_uputronics_stratum1_chrony/blob/main/steps/advanced_system_tuning.md
  - https://gpsd.gitlab.io/gpsd/gpsd-time-service-howto.html#_providing_local_ntp_service_using_ptp
  - https://docs.fedoraproject.org/en-US/fedora/latest/system-administrators-guide/servers/Configuring_PTP_Using_ptp4l/#sec-Serving_NTP_Time_with_PTP
  - https://sourceforge.net/p/linuxptp/mailman/linuxptp-devel/thread/1424738292.9759.53.camel%40intel.com/?page=1
-not everything works right out of the box with my particular setup, a system with a highly relaibale clock, driven by GNSS with PPS, and a set of clients which should be serverd by PTP due to its higher precision of the time signal; thus, I've compiled this 'best of'.
 
-#Preparation
+not everything works right out of the box with my particular setup, a system with a highly relaibale clock, driven by GNSS with PPS, and a set of clients which should be serverd by PTP due to its higher precision of the time signal; thus, I've compiled this 'best of'. – Thank you very much to the authors of above documentation for their valuable insights, particularly @tiagofreire-pt and the contributors to the linuxptp-devel mailing list!
+
+
+# Preparation
+
 
 ## Reducing ethernet coalescence on RX and TX
+(Adjusted from https://github.com/tiagofreire-pt/rpi_uputronics_stratum1_chrony/blob/main/steps/advanced_system_tuning.md)
 
 Every ethernet adaptor uses the coalescence method to gather packets and sent them on a bulk, for better thoughput efficiecy. 
 
@@ -50,9 +54,9 @@ tx-frame-high: n/a
 CQE mode RX: n/a  TX: n/a
 ```
 
-Both `rx-usecs` and `tx-usecs` have the value "49" microseconds.
+Both `rx-usecs` and `tx-usecs` have a value of 49 microseconds.
 
-We'll set both to the mininum accepted by the Rpi 5B ethernet driver:
+We'll set both to the mininum accepted by the Raspberry Pi ethernet driver:
 
 > sudo ethtool -C eth0 tx-usecs 4
 >
@@ -66,7 +70,7 @@ To revert to the default values:
 
 This could shave *circa* 40 usecs of response time over the `chrony ntpdata` statistics. Huge improvement on a NTP setup that has hardware timestamping and its higher accuracy.
 
-To make it persitent over restarts create a systemd service for eth0_coalescence:
+To make it persistent over restarts, simply create a `systemd` service for `eth0_coalescence`:
 
 > sudo nano /etc/systemd/system/eth0_coalescence.service
 
@@ -86,24 +90,27 @@ Type=oneshot
 WantedBy=multi-user.target
 ```
 
-Then, enable and start the eth0_coalescence service:
+Then, enable and start the `eth0_coalescence` service:
 
 > sudo systemctl enable --now eth0_coalescence.service
 
-# Enable support for PTP Hardware Clock (PHC) on the Ethernet chip
+# Enable support for the PTP Hardware Clock (PHC) on the Ethernet chip
+(Adjusted from https://github.com/tiagofreire-pt/rpi_uputronics_stratum1_chrony/blob/main/steps/advanced_system_tuning.md)
 
-Raspberry CM4 and Pi5 hav a PTP clock within the Ethernet chip, so we leverage that to have another high performance reference clock in ntpsec.
+Raspberry CM4 and Pi5 have a PTP hardware clock within their Ethernet chips, so we leverage those to have another high performance reference clock in ntpsec.
 
 Here is our setup and the related time modes (TAI: International Atonic Time (without leap seconds), UTC: Coordinated Universal Time (incl. leap seconds):
 
 ```
 GNSS --> gpsd --> chrony/ntpsec --> NTP --> phc2sys --> ptp4l --> PHC --> [network] --> PHC --> ptp4l --> phc2sys --> SHM --> ntpsec
-time:TAI      UTC               UTC     UTC         UTC       TAI     TAI           TAI     TAI       UTC         UTC     UTC
+time
+type:TAI      UTC               UTC     UTC         UTC       TAI     TAI           TAI     TAI       UTC         UTC     UTC
 ```
 
-As ntpsec does not synchronise the NIC	clock, it assumes the clock is running free. So, we need to use phc2sys to sync the PHC with the system time and ptp4l to respect the right number of leap seconds (currently 37), thus taking care of the conversion UTC-TAI and vice versa. –  Please ensure that you have a current version, e.g., https://packages.debian.org/source/testing/linuxptp / https://salsa.debian.org/multimedia-team/linuxptp !
+As `ntpsec`(or `ntp`for that matter) does not synchronise the NIC	clock PHC itself, we need to use phc2sys to sync the system time with PHC and leverage `ptp4l` to provide the right number of leap seconds (currently 37), thus taking care of the conversion UTC-TAI and vice versa. –  Please ensure that you have a reasonaly current version of `linuxptp`, e.g., https://packages.debian.org/source/testing/linuxptp / https://salsa.debian.org/multimedia-team/linuxptp !
 
 > sudo apt update && sudo apt install linuxptp -y
+
 
 ## Prepare the server side
 
@@ -194,7 +201,7 @@ Before=time-sync.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/phc2sys -a -r -r
+ExecStart=/usr/sbin/phc2sys -a -rr
 
 [Install]
 WantedBy=multi-user.target
@@ -203,6 +210,9 @@ WantedBy=multi-user.target
 Then, enable and start the `phc2sys` service for interface `eth0`:
 
 > sudo systemctl start phc2sys@eth0
+
+One might think that `phc2sys@.service` could also leverage the NTPSHM service (i.e., `ExecStart=/usr/sbin/phc2sys -a -rr  -E ntpshm -M 2` like on the clients' side, below), but this would leave the PHC unsynchronized and create an offset by those nasty 37 seconds of time difference between TAI and UTC between the clocks, as NTPSHM is only propagating the current time to the SHM2 memory slot and not synchronizing the PHC incl. the UTC-to-TAI adjsutment.
+
 
 ## Prepare the client side
 
@@ -226,7 +236,7 @@ Create a `systemd` service for `ptp4l`:
 > sudo systemctl enable ptp4l@eth0
 > sudo systemctl start ptp4l@eth0
 
-Leave the `systemd` service for ptp4l@eth0 as is.
+Leave the `systemd` service for `ptp4l@eth0` as is.
 
 Create a `systemd` service for `phc2sys`:
 
@@ -259,6 +269,7 @@ Then, enable and start the `phc2sys` service:
 
 > sudo systemctl start phc2sys@eth0
 
+
 ## Finish the client side
 
 First check with `sudo ntpshmmon` if SHM2 is properly propagated.
@@ -273,4 +284,5 @@ refclock shm unit 2 refid PTP
 
 Now check with `ntpmon` that your new `refclock` is working properly.
 
-## Yer unsolved: Enable the reverse correction direction in case GNSS reception fails; this is currently not possible as `phc2sys` can't switch servos.
+
+## Yet unsolved: Enable the reverse correction direction in case GNSS reception fails; this is currently not possible as `phc2sys` can't switch servos on the fly.
