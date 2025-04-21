@@ -178,6 +178,7 @@ Now, we simply follow https://salsa.debian.org/multimedia-team/linuxptp/-/blob/m
 Create a `systemd` service for `ptp4l` on interface `eth0`:
 
 > sudo systemctl enable ptp4l@eth0
+> 
 > sudo systemctl start ptp4l@eth0
 
 Leave the `systemd` service for `ptp4l@eth0` as is (if `ptp4l@eth0.service` does not start up correctly after system boot, you might wish to include `After=network-online.target`and `Wants=network-online.target`, see https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1070847)
