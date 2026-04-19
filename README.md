@@ -136,15 +136,10 @@ On the server, which has a highly precise time from its GNSS and PPS connection 
 > sudo nano /etc/linuxptp/ptp4l.conf
 
 ```
-[global]
-summary_interval        10
-# syslog only every 1024 seconds
-
-clockClass              255
-# means slave-only. Without this,
-# the client could theoretically advertise itself as a potential
-# grandmaster to other PTP nodes, which is almost never what you want.
-# Equivalent: add `-s` to ptp4l's command line.
+# 6   The clock node synchronizes its time to the master reference time source.
+#     PTP assigns a time table to the clock node. A clock node with time class 6
+#     cannot become a member clock of any other clocks in the domain.
+clockClass              6
 
 # use one of the following values for clock accuracy:
 # 0x20 25ns    0x24 2.5us    0x28 250us    0x2c 25ms    0x30 10s
@@ -153,19 +148,29 @@ clockClass              255
 # 0x23 1us     0x27 100us    0x2b 10ms     0x2f 1s
 clockAccuracy           0x23
 
-clock_servo             linreg
 # linear regression (do _not_ use ntpshm here!)
-free_running            1
+clock_servo             linreg
+
 # do NOT let PTP steer our system clock
+free_running            1
+
+# clear faults at once, helps if there's NIC timestamp driver problems
+fault_reset_interval    ASAP
+
+# only syslog every 1024 seconds
+summary_interval        10
+
+clock_servo             linreg
+
+ntpshm_segment          2
+
+network_transport       L2
+delay_mechanism         Auto
 
 # use one of the following for time source:
 # 0x10 atomic clock  0x30 terrestrial radio  0x50 NTP       0x90 other
 # 0x20 GPS           0x40 PTP                0x60 hand set  0xa0 int. oscillator
 timeSource              0x20
-
-[eth0]
-delay_mechanism Auto
-network_transport       L2
 ```
 
 Now, we simply follow https://salsa.debian.org/multimedia-team/linuxptp/-/blob/master/debian/README.Debian?ref_type=heads :
@@ -197,7 +202,7 @@ Before=time-sync.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c eth0 -w
+ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c eth0 -w -q
 
 [Install]
 WantedBy=multi-user.target
@@ -215,7 +220,7 @@ Now check phc2sys is running with the correct direction:
 
 > ps auxww | grep phc2sys
 
-Should show `phc2sys -s CLOCK_REALTIME -c eth0 -w`.
+Should show `phc2sys -s CLOCK_REALTIME -c eth0 -w -q`.
 
 Check the UTC offset is being advertised:
 
@@ -246,26 +251,34 @@ On the client, create a new file `/etc/linuxptp/ptp4l.conf` just with just this:
 > sudo nano /etc/linuxptp/ptp4l.conf
 
 ```
-[global]
-summary_interval 10
+clientOnly             1
+
+# 255 Clock node operating in slave-only mode.
+clockClass             255
+
+# clear faults at once, helps if there's NIC timestamp driver problems
+fault_reset_interval    ASAP
+
 # syslog only every 1024 seconds
+summary_interval        10
 
-clockClass 255
-# means slave-only. Without this,
-# the client could theoretically advertise itself as a potential
-# grandmaster to other PTP nodes, which is almost never what you want.
-# Equivalent: add `-s` to ptp4l's command line.
-
-clock_servo linreg
+clock_servo             linreg
 # linear regression (do _not_ use ntpshm here!)
 
-[eth0]
-delay_mechanism Auto
+ntpshm_segment          2
+
+network_transport       L2
+delay_mechanism         Auto
 # This defaults to E2E unless a P2P peer is detected. If there are
 # PTP-unaware switches between server and client, E2E suffers from
 # asymmetric queueing delay, which appears as a fixed offset.
 # For best results: direct cable between server and clients, or
 # use a PTP-aware (boundary or transparent clock) switch.
+
+ use one of the following for time source:
+# 0x10 atomic clock  0x30 terrestrial radio  0x50 NTP       0x90 other
+# 0x20 GPS           0x40 PTP                0x60 hand set  0xa0 int. oscillator
+timeSource             0x40
 ```
 
 Again, follow https://salsa.debian.org/multimedia-team/linuxptp/-/blob/master/debian/README.Debian?ref_type=heads :
@@ -276,7 +289,13 @@ Create a `systemd` service for `ptp4l`:
 >
 > sudo systemctl start ptp4l@eth0
 
-Leave the `systemd` service for `ptp4l@eth0` as is.
+Adjust the `systemd` service for `ptp4l@eth0` slightly by adding the following to avoid Debian-specifc timouts:
+
+```
+[Service]
+Restart=on-failure
+RestartSec=2s
+```
 
 Create a `systemd` service for `phc2sys`:
 
@@ -300,8 +319,7 @@ Type=simple
 # Client direction: PHC → SHM2 (not to CLOCK_REALTIME directly).
 # -E ntpshm feeds SHM segment 2 for ntpsec to consume as a refclock.
 # -M 2 selects SHM segment 2.
-# -w waits for the system clock to be sane before starting.
-ExecStart=/usr/sbin/phc2sys -s eth0 -E ntpshm -M 2 -w
+ExecStart=/usr/sbin/phc2sys -s eth0 -E ntpshm -M 2 -q
 
 [Install]
 WantedBy=multi-user.target
@@ -334,7 +352,7 @@ refclock shm unit 2 refid PTP time2 0.000180   # example: +180us
 ```
 Measure the offset with `ntpq -pn` over an hour of stable operation and use half the mean offset as the `time2` value (PTP splits asymmetry evenly between directions).
 
-Now check with `ntpmon` that your new `refclock` is working properly.
+Now check with `ntpmon -u` that your new `refclock` is working properly.
 
 
 ## Verification checklist
