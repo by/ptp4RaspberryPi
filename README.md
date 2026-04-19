@@ -117,21 +117,29 @@ good hygiene — commands later in the document use this path.
 
 The server's `phc2sys` needs to know the current UTC↔TAI offset (37 s) in order
 to feed the PHC in TAI. It picks this up from the kernel's TAI offset, which
-`ntpsec` sets — but only if `ntpsec` has been given a leap‑seconds file, if not already available:
+`ntpsec` sets — but only if `ntpsec` has been given a leap‑seconds file.
 
-```bash
-sudo apt install tzdata  # provides leap-seconds.list
-```
-
-In `/etc/ntpsec/ntp.conf`, add, if not already available:
+The file ships with the base `tzdata` package at
+`/usr/share/zoneinfo/leap-seconds.list` — no extra package install needed. Just
+point `ntpsec` at it. In `/etc/ntpsec/ntp.conf`, add:
 
 ```
 leapfile /usr/share/zoneinfo/leap-seconds.list
 ```
 
-Then `sudo systemctl restart ntpsec`. Without this, `phc2sys -w` on the server
-will happily copy UTC time into the PHC without offset, and every client will
-be 37 seconds off.
+Then:
+
+```bash
+sudo systemctl restart ntpsec
+```
+
+Without this, `phc2sys -w` on the server will happily copy UTC time into the
+PHC without offset, and every client will be 37 seconds off.
+
+Note: `leap-seconds.list` has an expiration date (re‑issued semi‑annually by
+IERS). Debian ships updated `tzdata` packages as new IERS bulletins are
+published, so routine `apt upgrade` keeps it fresh. `ntpsec` logs a warning as
+the expiration approaches.
 
 
 ## Preparation common to both sides
@@ -248,7 +256,7 @@ against PHY initialization and produce
 Fix via a drop‑in, **not** by editing the vendor file:
 
 ```bash
-sudo systemctl edit ptp4l@.service
+sudo systemctl edit ptp4l@eth0.service
 ```
 
 Add only:
@@ -275,37 +283,51 @@ You should see `port 1 (eth0): INITIALIZING to LISTENING` and, shortly after,
 
 ### phc2sys systemd unit (server direction)
 
-The vendor `phc2sys@.service` is designed for the client direction (PHC → system),
-so on the server we override it to go the other way (system → PHC).
+The vendor `phc2sys@.service` has two problems we need to work around:
+
+1. Its `ExecStart=` runs `phc2sys -w -s %I`, which is the client direction
+   (PHC as source). We need the server direction (system clock as source).
+2. It declares `Requires=ptp4l.service` and `After=ptp4l.service` — a
+   non-templated unit name that doesn't exist on modern Debian, which makes
+   `systemctl start` fail with `Unit ptp4l.service not found`.
+
+Problem 1 alone could be fixed with a drop-in that overrides `ExecStart=`.
+Problem 2 can't: systemd's drop-in mechanism does not allow resetting
+dependency directives (`Requires=`, `After=`, `Wants=`, `Before=`) to an empty
+list — only adding to them. So we have to override the whole unit file.
 
 ```bash
-sudo systemctl edit phc2sys@.service
+sudo systemctl edit --full phc2sys@.service
 ```
+
+Replace the entire content with:
 
 ```ini
 [Unit]
-Requires=
+Description=Synchronize system clock or PTP hardware clock (PHC) for %I
+Documentation=man:phc2sys
 Requires=ptp4l@%i.service
-After=
 After=ntpsec.service ptp4l@%i.service
+Before=time-sync.target
 
 [Service]
-ExecStart=
+Type=simple
 ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c %I -w -q
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-A few things worth understanding about this drop‑in:
+Key changes from the vendor: the bare `ptp4l.service` references are replaced
+with the templated `ptp4l@%i.service`; `ntpsec.service` is added to `After=` so
+that the system clock is disciplined before we start copying it to the PHC;
+and `ExecStart=` switches to server direction (`-s CLOCK_REALTIME -c %I`).
 
-- The empty `Requires=` and `After=` lines **reset** those list‑valued
-  directives before we add our own. Without the reset, the vendor's
-  `Requires=ptp4l.service` (non‑templated, and on modern Debian it doesn't exist)
-  stays in effect and blocks startup with `Unit ptp4l.service not found`.
-- The empty `ExecStart=` resets the vendor's `ExecStart` so ours replaces rather
-  than duplicates it. systemd allows only one `ExecStart` for `Type=simple`.
-- `-s CLOCK_REALTIME -c %I` means source is the system clock, target is the
-  interface's PHC. This is the server direction.
-- `-w` makes `phc2sys` wait for `ptp4l` to be ready and picks up the UTC↔TAI
-  offset from the kernel (which is why the leapfile prerequisite matters).
+The cost of `--full` is that the override is a full local copy of the unit
+rather than a patch — future upstream improvements won't flow in
+automatically. If Debian eventually fixes the vendor unit
+(worth a bug report), you can `systemctl revert phc2sys@.service` to adopt
+the fix.
 
 Enable and start:
 
@@ -383,7 +405,7 @@ ptp_minor_version       0
 ### ptp4l systemd unit
 
 ```bash
-sudo systemctl edit ptp4l@.service
+sudo systemctl edit ptp4l@eth0.service
 ```
 
 ```ini
@@ -417,20 +439,28 @@ and avoids surprises if you tighten `ptp4l.conf` later.)
 
 ### phc2sys systemd unit (client direction)
 
+Same vendor-unit problem as on the server: the shipped `phc2sys@.service` has
+non-removable `Requires=ptp4l.service` / `After=ptp4l.service` that won't
+resolve, and an `ExecStart=` that doesn't match what we want. We override the
+whole unit.
+
 ```bash
-sudo systemctl edit phc2sys@.service
+sudo systemctl edit --full phc2sys@.service
 ```
 
 ```ini
 [Unit]
-Requires=
+Description=Synchronize system clock or PTP hardware clock (PHC) for %I
+Documentation=man:phc2sys
 Requires=ptp4l@%i.service
-After=
 After=ntpsec.service ptp4l@%i.service
 
 [Service]
-ExecStart=
+Type=simple
 ExecStart=/usr/sbin/phc2sys -s %I -E ntpshm -f /etc/linuxptp/phc2sys.conf -q
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 - `-s %I` — source is the interface's PHC.
@@ -578,38 +608,67 @@ been modified in place.
 
 ### `Unit ptp4l.service not found` when starting phc2sys
 
-The vendor `phc2sys@.service` has `Requires=ptp4l.service` (non‑templated)
-which on modern Debian doesn't exist. Until
-[Debian #linuxptp](https://bugs.debian.org/cgi-bin/pkgreport.cgi?package=linuxptp)
-gets a fix, the drop‑in above works around it. If it still fails after adding
-the drop‑in:
+The vendor `phc2sys@.service` has `Requires=ptp4l.service` / `After=ptp4l.service`
+(non-templated) which on modern Debian doesn't exist — only `ptp4l@.service`
+does. A drop-in *cannot* fix this: systemd does not allow dependency
+directives (`Requires=`, `After=`, etc.) to be reset or subtracted from in a
+drop-in, only added to. The vendor's broken references stay in effect no
+matter what you put in a drop-in.
+
+The fix is to override the whole unit with `systemctl edit --full phc2sys@.service`
+(shown above in the server and client sections). If you previously tried a
+drop-in approach with empty `Requires=` / `After=` lines expecting them to
+reset, remove that drop-in first:
 
 ```bash
-systemctl cat phc2sys@eth0.service
+sudo rm -rf /etc/systemd/system/phc2sys@.service.d
+sudo systemctl daemon-reload
 ```
 
-Look at the merged `Requires=` and `After=` lines. If either still mentions
-bare `ptp4l.service`, the reset (empty `Requires=`) didn't take. Common causes:
-reset placed after the new value (it wipes both), typo in the directive name,
-or `daemon-reload` not run.
+Then do the full override.
+
+To verify dependencies resolve correctly after the override:
+
+```bash
+systemctl show phc2sys@eth0.service -p Requires -p After
+```
+
+`Requires=` should contain only `ptp4l@eth0.service` plus systemd-auto-injected
+targets (`sysinit.target`, `system-phc2sys.slice`). If bare `ptp4l.service`
+still appears, the override didn't take — check with `systemctl cat
+phc2sys@eth0.service` that it's reading your `/etc/systemd/system/phc2sys@.service`
+and not the vendor file.
 
 ### Drop‑in file rules cheat sheet
 
 - A drop‑in is a **patch**, not a replacement. Include only what differs from
   the vendor unit.
-- List‑valued keys (`ExecStart=`, `Requires=`, `After=`, `Wants=`,
-  `Environment=`, `ExecStartPre=`, …) **append** in drop‑ins. To replace,
-  first write an empty `Key=` then the new value. Order is critical: reset
-  first, then assign.
+- **Exec‑type list directives** (`ExecStart=`, `ExecStartPre=`, `ExecStop=`,
+  etc.) and other list directives like `Environment=`, `EnvironmentFile=`,
+  `ConditionPathExists=` can be reset by an empty assignment, then reassigned:
+
+  ```ini
+  [Service]
+  ExecStart=
+  ExecStart=/new/command
+  ```
+
+- **Dependency directives cannot be reset in a drop‑in.** `Requires=`,
+  `After=`, `Wants=`, `Before=`, `Conflicts=`, `Requisite=`, `BindsTo=`,
+  `PartOf=` — these can only be *added to* via drop‑in. To remove a dependency
+  declared in the vendor unit, you have to override the whole unit with
+  `systemctl edit --full <unit>` and edit the offending line out of the local
+  copy.
 - `[Install]` sections in drop‑ins are ignored. Enable/disable is done via
   `systemctl enable/disable`.
 - Always verify with `systemctl cat <unit>` (merged view) after editing, and
   `systemd-analyze verify <unit>` to catch syntax problems before trying to
-  start.
+  start. `systemctl show <unit> -p Requires -p After` shows what the parser
+  actually resolved, which is the authoritative view.
 - Never edit files under `/usr/lib/systemd/system/` or `/lib/systemd/system/`
   directly — they get overwritten on package upgrades. Use
-  `systemctl edit <unit>` (instance drop‑in) or
-  `systemctl edit <template>@.service` (template‑level drop‑in).
+  `systemctl edit <unit>` (instance drop‑in), `systemctl edit <template>@.service`
+  (template‑level drop‑in), or `systemctl edit --full <unit>` (full override).
 
 ### Clients off by exactly 37 seconds
 
