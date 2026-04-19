@@ -1,112 +1,46 @@
-> [!WARNING] 
-> This is optional! Proceed with caution and at your own risk!
+# ptp4RaspberryPi
 
-While there is quite some information available how to properly set up PTP on your Raspberry device, e.g.,
- - https://github.com/tiagofreire-pt/rpi_uputronics_stratum1_chrony/blob/main/steps/advanced_system_tuning.md
- - https://gpsd.gitlab.io/gpsd/gpsd-time-service-howto.html#_providing_local_ntp_service_using_ptp
- - https://docs.fedoraproject.org/en-US/fedora/latest/system-administrators-guide/servers/Configuring_PTP_Using_ptp4l/#sec-Serving_NTP_Time_with_PTP
- - https://sourceforge.net/p/linuxptp/mailman/linuxptp-devel/thread/1424738292.9759.53.camel%40intel.com/?page=1
+PTP (Precision Time Protocol) on Raspberry Pi, served from a GNSS/PPS‑disciplined
+grandmaster to Pi clients, and fed back into `ntpsec` on each client as a
+low‑jitter refclock.
 
-not everything works right out of the box with my particular setup, a system with a highly reliable clock, driven by GNSS with PPS, and a set of clients which should be served by PTP due to its higher precision of the time signal; thus, I've compiled this 'best of'. – Thank you very much to the authors of above documentation for their valuable insights, particularly @tiagofreire-pt and the contributors to the linuxptp-devel mailing list!
+> **Warning.** This is optional and experimental. Proceed at your own risk.
+
+Useful references that informed this document:
+
+- <https://github.com/tiagofreire-pt/rpi_uputronics_stratum1_chrony/blob/main/steps/advanced_system_tuning.md>
+- <https://gpsd.gitlab.io/gpsd/gpsd-time-service-howto.html#_providing_local_ntp_service_using_ptp>
+- <https://docs.fedoraproject.org/en-US/fedora/latest/system-administrators-guide/servers/Configuring_PTP_Using_ptp4l/#sec-Serving_NTP_Time_with_PTP>
+- <https://sourceforge.net/p/linuxptp/mailman/linuxptp-devel/thread/1424738292.9759.53.camel%40intel.com/>
+- Debian packaging README: <https://salsa.debian.org/multimedia-team/linuxptp/-/blob/master/debian/README.Debian>
+
+Thanks to `@tiagofreire-pt` and the `linuxptp-devel` contributors.
 
 
-# Preparation for both server and client side
+## Scope and assumptions
+
+- **Hardware**: Raspberry Pi CM4, CM5, or Pi 5 on both sides. These have a PTP
+  Hardware Clock (PHC) in the Ethernet MAC.
+- **OS**: Debian 12 (bookworm) or 13 (trixie); Raspberry Pi OS based on either.
+  `linuxptp` 4.0+ is assumed — older versions use different option names
+  (`slaveOnly` instead of `clientOnly`, numeric `fault_reset_interval`, etc.).
+- **Topology**: server and clients on the same L2 segment, ideally direct or
+  through a PTP‑aware switch. Unmanaged switches in the path will cause
+  path‑asymmetry offsets; see the troubleshooting section.
+- **Time source on server**: GNSS + PPS, disciplining `ntpsec`.
+- **Server role**: PTP grandmaster, clockClass 6.
+- **Client role**: PTP client, consuming time via `phc2sys -E ntpshm` and
+  feeding it to `ntpsec` as a refclock.
 
 
-## Reducing ethernet coalescence on RX and TX
-(Adjusted from https://github.com/tiagofreire-pt/rpi_uputronics_stratum1_chrony/blob/main/steps/advanced_system_tuning.md)
-
-Every ethernet adaptor uses the coalescence method to gather packets and send them in a bulk, for better throughput efficiency.
-
-But this method introduces valuable latency and jitter on NTP or PTP-E2E packets.
-
-Check the defaults:
-> sudo ethtool -c eth0
-
-```
-Coalesce parameters for eth0:
-Adaptive RX: n/a  TX: n/a
-stats-block-usecs: n/a
-sample-interval: n/a
-pkt-rate-low: n/a
-pkt-rate-high: n/a
-
-rx-usecs: 49
-rx-frames: n/a
-rx-usecs-irq: n/a
-rx-frames-irq: n/a
-
-tx-usecs: 49
-tx-frames: n/a
-tx-usecs-irq: n/a
-tx-frames-irq: n/a
-
-rx-usecs-low: n/a
-rx-frame-low: n/a
-tx-usecs-low: n/a
-tx-frame-low: n/a
-
-rx-usecs-high: n/a
-rx-frame-high: n/a
-tx-usecs-high: n/a
-tx-frame-high: n/a
-
-CQE mode RX: n/a  TX: n/a
-```
-
-Both `rx-usecs` and `tx-usecs` have a value of 49 microseconds.
-
-We'll set both to the minimum accepted by the Raspberry Pi ethernet driver:
-
-> sudo ethtool -C eth0 tx-usecs 4
->
-> sudo ethtool -C eth0 rx-usecs 4
-
-To revert to the default values:
-
-> sudo ethtool -C eth0 tx-usecs 49
->
-> sudo ethtool -C eth0 rx-usecs 49
-
-This could shave *circa* 40 usecs of response time over the `chrony ntpdata` statistics. Huge improvement on a NTP setup that has hardware timestamping and its higher accuracy.
-
-To make it persistent over restarts, simply create a `systemd` service for `eth0_coalescence`:
-
-> sudo nano /etc/systemd/system/eth0_coalescence.service
-
-Add this:
-
-```
-[Unit]
-Description=Setting Speed
-Requires=network.target
-After=network.target
-
-[Service]
-ExecStart=/usr/sbin/ethtool -C eth0 tx-usecs 4 rx-usecs 4
-Type=oneshot
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then, enable and start the `eth0_coalescence` service:
-
-> sudo systemctl enable --now eth0_coalescence.service
-
-# Enable support for the PTP Hardware Clock (PHC) on the Ethernet chip
-(Adjusted from https://github.com/tiagofreire-pt/rpi_uputronics_stratum1_chrony/blob/main/steps/advanced_system_tuning.md)
-
-Raspberry CM4 and Pi5 have a PTP hardware clock within their Ethernet chips, so we leverage those to have another high performance reference clock in ntpsec.
-
-Here is our setup and the related time modes (TAI: International Atomic Time (without leap seconds), UTC: Coordinated Universal Time (incl. leap seconds):
+## Architecture
 
 ```
 Server:
   GNSS ──► gpsd ──► ntpsec ──► system clock (UTC)
                                       │
                                       ▼
-                                  phc2sys (automagically applies +37s leap offset)
+                                  phc2sys -w  (applies UTC→TAI offset, +37s)
                                       │
                                       ▼
                                    PHC (TAI) ──► ptp4l ──► network
@@ -118,278 +52,599 @@ Client:                                                    network
                                    PHC (TAI)  ◄──  ptp4l  ◄───┘
                                       │
                                       ▼
-                                  phc2sys -E ntpshm (automagically strips +37s)
+                                  phc2sys -E ntpshm  (strips TAI→UTC, -37s)
                                       │
                                       ▼
                                    SHM(2) (UTC) ──► ntpsec
 ```
 
-As `ntpsec` (or `ntp` for that matter) does not synchronise the NIC clock PHC itself, we need to use phc2sys to sync the system time with PHC and leverage `ptp4l` to provide the right number of leap seconds (currently 37), thus taking care of the conversion UTC-TAI and vice versa. – Please ensure that you have a reasonably current version of `linuxptp`, e.g., https://packages.debian.org/source/testing/linuxptp / https://salsa.debian.org/multimedia-team/linuxptp !
+Why `phc2sys` in both directions? `ntpsec` (and `ntpd`) do not discipline the
+NIC's PHC. `phc2sys` is the bridge that moves time between the system clock
+and the PHC, and it's also the only component that correctly applies the
+UTC↔TAI offset when it crosses that boundary. Doing this inside `ptp4l.conf`
+(`ntpshm` as a servo there) uses subtly different semantics and silently
+produces 37‑second errors on clients.
 
-> sudo apt update && sudo apt install linuxptp -y
 
+## Prerequisites
 
-## Prepare the server side (GNSS/PPS grandmaster)
+### Install linuxptp on both sides
 
-On the server, which has a highly precise time from its GNSS and PPS connection via ntpsec, we create a new file `/etc/linuxptp/ptp4l.conf` and prepare it to provide the exact time available from the system clock to the PHC, but also make sure that the system clock is not adjusted back from the PTP side:
-
-> sudo nano /etc/linuxptp/ptp4l.conf
-
-```
-# 6   The clock node synchronizes its time to the master reference time source.
-#     PTP assigns a time table to the clock node. A clock node with time class 6
-#     cannot become a member clock of any other clocks in the domain.
-clockClass              6
-
-# use one of the following values for clock accuracy:
-# 0x20 25ns    0x24 2.5us    0x28 250us    0x2c 25ms    0x30 10s
-# 0x21 100ns   0x25 10us     0x29 1ms      0x2d 100ms   0x31 more than 10s
-# 0x22 250ns   0x26 25us     0x2a 2.5ms    0x2e 250ms   0xfe unknown
-# 0x23 1us     0x27 100us    0x2b 10ms     0x2f 1s
-clockAccuracy           0x23
-
-# linear regression (do _not_ use ntpshm here!)
-clock_servo             linreg
-
-# do NOT let PTP steer our system clock
-free_running            1
-
-# clear faults at once, helps if there's NIC timestamp driver problems
-fault_reset_interval    ASAP
-
-# only syslog every 1024 seconds
-summary_interval        10
-
-clock_servo             linreg
-
-ntpshm_segment          2
-
-network_transport       L2
-delay_mechanism         Auto
-
-# use one of the following for time source:
-# 0x10 atomic clock  0x30 terrestrial radio  0x50 NTP       0x90 other
-# 0x20 GPS           0x40 PTP                0x60 hand set  0xa0 int. oscillator
-timeSource              0x20
+```bash
+sudo apt update && sudo apt install linuxptp
 ```
 
-Now, we simply follow https://salsa.debian.org/multimedia-team/linuxptp/-/blob/master/debian/README.Debian?ref_type=heads :
+Confirm version 4.x:
 
-Create a `systemd` service for `ptp4l` on interface `eth0`:
+```bash
+ptp4l --version
+```
 
-> sudo systemctl enable ptp4l@eth0
->
-> sudo systemctl start ptp4l@eth0
+If you're on 3.x, several options in this document (`clientOnly`,
+`fault_reset_interval ASAP`) need to be written in their 3.x form; consider
+upgrading to trixie or backports instead.
 
-Leave the `systemd` service for `ptp4l@eth0` as is (if `ptp4l@eth0.service` does not start up correctly after system boot, you might wish to include `After=network-online.target` and `Wants=network-online.target`, see https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1070847)
+### Verify hardware timestamping support
 
-Create a `systemd` service for `phc2sys`:
+```bash
+ethtool -T eth0
+```
 
-> sudo systemctl enable phc2sys@eth0
-
-Adjust the `systemd` service file for `phc2sys` to adjust the PTP hardware clock, based on the system clock, but wait until it is stepped in sync:
-
-> sudo nano /lib/systemd/system/phc2sys@.service
+You need to see entries like:
 
 ```
+PTP Hardware Clock: <N>
+Hardware Transmit Timestamp Modes: ... on
+Hardware Receive Filter Modes:    ... ptp-v2-l2-event  (or similar)
+```
+
+If `PTP Hardware Clock: none`, this NIC cannot do hardware timestamping and the
+rest of the guide does not apply as written; you'd need `time_stamping software`
+and accept ~tens of µs accuracy. On CM4, CM5, and Pi 5 the on‑board Ethernet
+has a PHC; on older Pis it does not.
+
+### Identify the PHC device
+
+```bash
+ethtool -T eth0 | grep 'PTP Hardware Clock'
+```
+
+If it says `PTP Hardware Clock: 0`, that's `/dev/ptp0`; `1` → `/dev/ptp1`, etc.
+On a Pi with only one PHC this is always `/dev/ptp0`, but the explicit check is
+good hygiene — commands later in the document use this path.
+
+### Configure the leap‑seconds file for ntpsec (server)
+
+The server's `phc2sys` needs to know the current UTC↔TAI offset (37 s) in order
+to feed the PHC in TAI. It picks this up from the kernel's TAI offset, which
+`ntpsec` sets — but only if `ntpsec` has been given a leap‑seconds file, if not already available:
+
+```bash
+sudo apt install tzdata  # provides leap-seconds.list
+```
+
+In `/etc/ntpsec/ntp.conf`, add, if not already available:
+
+```
+leapfile /usr/share/zoneinfo/leap-seconds.list
+```
+
+Then `sudo systemctl restart ntpsec`. Without this, `phc2sys -w` on the server
+will happily copy UTC time into the PHC without offset, and every client will
+be 37 seconds off.
+
+
+## Preparation common to both sides
+
+### Reduce Ethernet coalescence
+
+Ethernet drivers coalesce packet interrupts for throughput, at the cost of
+latency. For PTP we want the opposite tradeoff. Current values:
+
+```bash
+sudo ethtool -c eth0
+```
+
+Set to the minimum the Pi's driver accepts:
+
+```bash
+sudo ethtool -C eth0 rx-usecs 4 tx-usecs 4
+```
+
+Make it persistent with a small service:
+
+```bash
+sudo systemctl edit --force --full eth0-coalescence.service
+```
+
+Paste:
+
+```ini
 [Unit]
-Description=Synchronize system clock or PTP hardware clock (PHC)
-Documentation=man:phc2sys
-After=ntpsec.service
-Requires=ptp4l@%i.service
-After=ptp4l@%i.service
-Before=time-sync.target
+Description=Reduce eth0 coalescence for PTP
+Wants=network.target
+After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c eth0 -w -q
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -C eth0 rx-usecs 4 tx-usecs 4
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Then, enable and start the `phc2sys` service for interface `eth0`:
-
-> sudo systemctl daemon-reload
->
-> sudo systemctl enable --now phc2sys@eth0
-
-One might think that `phc2sys@.service` could also leverage the NTPSHM service (i.e., `ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c eth0 -w -E ntpshm -M 2` like on the clients' side, below), but this would leave the PHC unsynchronized and create an offset by those nasty 37 seconds of time difference between TAI and UTC between the clocks, as NTPSHM is only propagating the current time to the SHM2 memory slot and not synchronizing the PHC incl. the UTC-to-TAI adjustment.
-
-Now check phc2sys is running with the correct direction:
-
-> ps auxww | grep phc2sys
-
-Should show `phc2sys -s CLOCK_REALTIME -c eth0 -w -q`.
-
-Check the UTC offset is being advertised:
-
-> sudo pmc -u -b 0 "GET TIME_PROPERTIES_DATA_SET"
-
-Should include `currentUtcOffset 37` and `currentUtcOffsetValid 1`.
-
-Check clock identities:
-
-> sudo pmc -u -b 0 "GET PARENT_DATA_SET"
-
-`grandmasterClockClass` should be 6, `grandmasterIdentity` should match your server's MAC-derived ID.
-
-Compare PHC to system clock:
-
-> sudo phc_ctl /dev/ptp0 get; date -u '+%Y-%m-%d %H:%M:%S.%N UTC'
-
-In 2026, PHC should be **exactly 37 seconds ahead** of UTC (TAI time), not 0s and not some µs offset.
-
-**The `phc2sys` log line format `<pair-id> offset ...` is a label pair (e.g., `eth0 sys`), not a direction indicator.**
-The actual direction is determined by the command-line flags (`-s` = source, `-c` = target). Don't be fooled by the log line showing the same format before and after a direction fix.
-
-
-## Prepare the client side
-
-On the client, create a new file `/etc/linuxptp/ptp4l.conf` just with just this:
-
-> sudo nano /etc/linuxptp/ptp4l.conf
-
+```bash
+sudo systemctl enable --now eth0-coalescence.service
 ```
-clientOnly             1
 
-# 255 Clock node operating in slave-only mode.
-clockClass             255
+This shaves roughly 40 µs off chrony/ntp response jitter. Apply it on both
+server and clients.
 
-# clear faults at once, helps if there's NIC timestamp driver problems
+
+## Server side (GNSS/PPS grandmaster)
+
+### ptp4l configuration
+
+The server's PHC is driven by `phc2sys` from the system clock (which `ntpsec`
+disciplines from GNSS). `ptp4l` only publishes that PHC to the network — it
+does not discipline it.
+
+Create `/etc/linuxptp/ptp4l.conf`:
+
+```ini
+[global]
+
+# Grandmaster attributes — clockClass 6 = "synchronized to primary reference".
+clockClass              6
+
+# Clock accuracy. Conservative for a GPSDO-fed Pi:
+#   0x20 25ns    0x23 1us     0x26 25us    0x29 1ms
+#   0x21 100ns   0x24 2.5us   0x27 100us   0x2a 2.5ms
+#   0x22 250ns   0x25 10us    0x28 250us   0xfe unknown
+clockAccuracy           0x23
+
+# Make this node unambiguously preferred over any accidental second grandmaster.
+priority1               64
+priority2               128
+
+# ptp4l uses the PHC as its clock. It does NOT discipline the PHC here;
+# phc2sys does that, driven by ntpsec. "free_running" prevents ptp4l from
+# trying to steer the PHC if it ever receives PTP messages itself.
+free_running            1
+
+# Clear port faults immediately (helps during driver or link hiccups).
 fault_reset_interval    ASAP
 
-# syslog only every 1024 seconds
+# One summary log line per 2^10 = 1024 s.
 summary_interval        10
 
+# Linear-regression servo. Irrelevant on a free-running master, but set anyway.
 clock_servo             linreg
-# linear regression (do _not_ use ntpshm here!)
 
-ntpshm_segment          2
+# Time source: 0x10 atomic, 0x20 GPS, 0x30 terrestrial radio, 0x40 PTP,
+#              0x50 NTP, 0x60 hand-set, 0x90 other, 0xa0 internal osc.
+timeSource              0x20
 
+# Layer-2 transport with auto delay mechanism (E2E by default; P2P if peer advertises).
 network_transport       L2
 delay_mechanism         Auto
-# This defaults to E2E unless a P2P peer is detected. If there are
-# PTP-unaware switches between server and client, E2E suffers from
-# asymmetric queueing delay, which appears as a fixed offset.
-# For best results: direct cable between server and clients, or
-# use a PTP-aware (boundary or transparent clock) switch.
 
-# use one of the following for time source:
-# 0x10 atomic clock  0x30 terrestrial radio  0x50 NTP       0x90 other
-# 0x20 GPS           0x40 PTP                0x60 hand set  0xa0 int. oscillator
-timeSource             0x40
+# Hardware timestamping (default, but explicit is better).
+time_stamping           hardware
 ```
 
-Again, follow https://salsa.debian.org/multimedia-team/linuxptp/-/blob/master/debian/README.Debian?ref_type=heads :
+Note: no `ntpshm_segment` here — the server does not feed SHM, only clients do.
 
-Create a `systemd` service for `ptp4l`:
+### ptp4l systemd unit
 
-> sudo systemctl enable ptp4l@eth0
->
-> sudo systemctl start ptp4l@eth0
+Debian's `linuxptp` 4.x ships the template unit
+`/usr/lib/systemd/system/ptp4l@.service`. The vendor unit's one rough edge is
+that it doesn't wait for the network to be fully up, which on Pis can race
+against PHY initialization and produce
+`ioctl SIOCSHWTSTAMP failed: Invalid argument` at boot
+(Debian bug [#1070847](https://bugs.debian.org/1070847)).
 
-Adjust the `systemd` service for `ptp4l@eth0` slightly by adding the following to avoid Debian-specifc timouts:
+Fix via a drop‑in, **not** by editing the vendor file:
 
+```bash
+sudo systemctl edit ptp4l@.service
 ```
+
+Add only:
+
+```ini
+[Unit]
+After=network-online.target
+Wants=network-online.target
+
 [Service]
 Restart=on-failure
 RestartSec=2s
 ```
 
-Create a `systemd` service for `phc2sys`:
+Enable and start:
 
-> sudo systemctl enable phc2sys@eth0
-
-Adjust the `systemd` service for `phc2sys`:
-
-> sudo nano /lib/systemd/system/phc2sys@.service
-
+```bash
+sudo systemctl enable --now ptp4l@eth0.service
+systemctl status ptp4l@eth0.service
 ```
+
+You should see `port 1 (eth0): INITIALIZING to LISTENING` and, shortly after,
+`LISTENING to MASTER on ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES`.
+
+### phc2sys systemd unit (server direction)
+
+The vendor `phc2sys@.service` is designed for the client direction (PHC → system),
+so on the server we override it to go the other way (system → PHC).
+
+```bash
+sudo systemctl edit phc2sys@.service
+```
+
+```ini
 [Unit]
-Description=Synchronize system clock or PTP hardware clock (PHC)
-Documentation=man:phc2sys
-After=ntpsec.service
+Requires=
 Requires=ptp4l@%i.service
-After=ptp4l@%i.service
-#Before=time-sync.target    # intentionally omitted on clients
+After=
+After=ntpsec.service ptp4l@%i.service
 
 [Service]
-Type=simple
-# Client direction: PHC → SHM2 (not to CLOCK_REALTIME directly).
-# -E ntpshm feeds SHM segment 2 for ntpsec to consume as a refclock.
-# -M 2 selects SHM segment 2.
-ExecStart=/usr/sbin/phc2sys -s eth0 -E ntpshm -M 2 -q
-
-[Install]
-WantedBy=multi-user.target
+ExecStart=
+ExecStart=/usr/sbin/phc2sys -s CLOCK_REALTIME -c %I -w -q
 ```
 
-Do **NOT** replicate the `-E ntpshm` behavior inside `ptp4l.conf` (via `ntpshm` in `[global]`). `ptp4l`'s SHM writer uses different semantics from `phc2sys`'s and does not apply the UTC offset the same way. Mixing them causes silent time errors — clients receive TAI time labeled as UTC, which is off by 37 seconds. Always route SHM through `phc2sys -E ntpshm` only.
+A few things worth understanding about this drop‑in:
 
-Then, enable and start the `phc2sys` service:
+- The empty `Requires=` and `After=` lines **reset** those list‑valued
+  directives before we add our own. Without the reset, the vendor's
+  `Requires=ptp4l.service` (non‑templated, and on modern Debian it doesn't exist)
+  stays in effect and blocks startup with `Unit ptp4l.service not found`.
+- The empty `ExecStart=` resets the vendor's `ExecStart` so ours replaces rather
+  than duplicates it. systemd allows only one `ExecStart` for `Type=simple`.
+- `-s CLOCK_REALTIME -c %I` means source is the system clock, target is the
+  interface's PHC. This is the server direction.
+- `-w` makes `phc2sys` wait for `ptp4l` to be ready and picks up the UTC↔TAI
+  offset from the kernel (which is why the leapfile prerequisite matters).
 
-> sudo systemctl daemon-reload
->
-> sudo systemctl enable --now phc2sys@eth0
+Enable and start:
+
+```bash
+sudo systemctl enable --now phc2sys@eth0.service
+systemctl status phc2sys@eth0.service
+```
+
+### Server verification
+
+```bash
+# Exactly one ptp4l and one phc2sys, and phc2sys is in system→PHC direction:
+ps auxww | grep -E '[p]tp4l|[p]hc2sys'
+
+# PHC should be ~37 s ahead of UTC (i.e. TAI):
+sudo phc_ctl /dev/ptp0 cmp
+
+# ptp4l is advertising the current UTC offset and the right clockClass:
+sudo pmc -u -b 0 "GET TIME_PROPERTIES_DATA_SET"      # currentUtcOffset 37, currentUtcOffsetValid 1
+sudo pmc -u -b 0 "GET PARENT_DATA_SET"               # grandmasterClockClass 6
+
+# ntpsec is in charge of system time:
+ntpq -c "rv 0 refid,stratum"
+```
+
+`phc_ctl ... cmp` prints the offset between the PHC and `CLOCK_REALTIME`
+atomically; don't compare `phc_ctl get` against `date` by eye, the shell latency
+swamps the real error.
 
 
-## Finish the client side
+## Client side
 
-First check with `sudo ntpshmmon` if SHM2 is properly propagated.
+### ptp4l configuration
 
-Now, add this new `refclock` 'ntpsec' configuration with
+Create `/etc/linuxptp/ptp4l.conf`:
 
->  sudo nano /etc/ntpsec/ntp.conf
+```ini
+[global]
+
+# This node only ever acts as a PTP client.
+clientOnly              1
+
+# Client reports clockClass 255 (not a potential master).
+clockClass              255
+
+# Same defensive settings as server.
+fault_reset_interval    ASAP
+summary_interval        10
+clock_servo             linreg
+
+# SHM segment for phc2sys -E ntpshm to write to.
+# Must match the "unit N" in ntp.conf's refclock shm.
+ntpshm_segment          2
+
+network_transport       L2
+delay_mechanism         Auto
+time_stamping           hardware
+
+# Time source: 0x40 PTP (we receive time from a PTP grandmaster).
+timeSource              0x40
+
+# --- Raspberry Pi CM4/CM5/Pi5 quirks ---------------------------------------
+# The macb/bcmgenet driver is slow to return TX timestamps. The default
+# tx_timestamp_timeout of 1 ms causes "timed out while polling for tx timestamp"
+# followed by FAULT_DETECTED, which in this configuration loops forever.
+# 100 ms is plenty of margin on this hardware.
+tx_timestamp_timeout    100
+
+# The Pi Ethernet IP doesn't handle PTP 2.1 correctly. Pin the on-wire minor
+# version to 0 (PTP 2.0) for compatibility. Required on linuxptp 4.x with Pi
+# hardware; harmless to leave on linuxptp 3.x.
+ptp_minor_version       0
+```
+
+### ptp4l systemd unit
+
+```bash
+sudo systemctl edit ptp4l@.service
+```
+
+```ini
+[Unit]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Restart=on-failure
+RestartSec=2s
+```
+
+```bash
+sudo systemctl enable --now ptp4l@eth0.service
+```
+
+### phc2sys config for SHM feed
+
+`phc2sys` needs to know which SHM segment to write. There's no command‑line
+flag for this; it comes from a config file. Create
+`/etc/linuxptp/phc2sys.conf`:
+
+```ini
+[global]
+ntpshm_segment          2
+```
+
+(Why a separate file? Passing `-f /etc/linuxptp/ptp4l.conf` also works —
+`phc2sys` ignores `ptp4l`‑specific options — but a dedicated file is clearer
+and avoids surprises if you tighten `ptp4l.conf` later.)
+
+### phc2sys systemd unit (client direction)
+
+```bash
+sudo systemctl edit phc2sys@.service
+```
+
+```ini
+[Unit]
+Requires=
+Requires=ptp4l@%i.service
+After=
+After=ntpsec.service ptp4l@%i.service
+
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/phc2sys -s %I -E ntpshm -f /etc/linuxptp/phc2sys.conf -q
+```
+
+- `-s %I` — source is the interface's PHC.
+- `-E ntpshm` — servo writes to SHM instead of steering a local clock. Target
+  selected by the config file's `ntpshm_segment`.
+- No `Before=time-sync.target` here — on the client, `ntpsec` is the authority;
+  we don't want to signal "time is synced" before `ntpsec` has actually locked
+  onto the SHM refclock.
+
+```bash
+sudo systemctl enable --now phc2sys@eth0.service
+```
+
+### ntpsec refclock
+
+In `/etc/ntpsec/ntp.conf`, add:
 
 ```
 refclock shm unit 2 refid PTP
 ```
 
-If you observe a persistent fixed offset (tens to hundreds of µs) on the client after convergence, this is typically network path asymmetry between server and client. It can be calibrated out with a `time2` fudge:
-```
-refclock shm unit 2 refid PTP time2 0.000180   # example: +180us
-```
-Measure the offset with `ntpq -pn` over an hour of stable operation and use half the mean offset as the `time2` value (PTP splits asymmetry evenly between directions).
+`unit 2` must match the `ntpshm_segment` set above. Restart:
 
-Now check with `ntpmon -u` that your new `refclock` is working properly.
-
-
-## Verification checklist
-
-On the server:
-
-```
-# Direction is system → PHC
-ps auxww | grep phc2sys | grep -v grep
-
-# PHC is 37s ahead of UTC (TAI time)
-sudo phc_ctl /dev/ptp0 get
-date -u '+%Y-%m-%d %H:%M:%S.%N UTC'
-
-# ptp4l advertising correct UTC offset
-sudo pmc -u -b 0 "GET TIME_PROPERTIES_DATA_SET"
-
-# ntpsec is the authoritative system clock source
-ntpq -c "rv 0 refid,stratum"
+```bash
+sudo systemctl restart ntpsec
 ```
 
-On the client:
+Verify SHM is actually being written and consumed:
+
+```bash
+sudo ntpshmmon -c 10       # should show 10 samples on unit 2 with small offsets
+ntpq -pn                   # refid=PTP should eventually get '*' (system peer)
+```
+
+`ntpq -pn` can take a few minutes to promote the PTP refclock to system peer
+as `ntpsec` collects enough samples to trust it.
+
+### Calibrating path asymmetry
+
+A stable residual offset (typically tens to hundreds of µs) between client and
+server after full convergence usually indicates an asymmetric network path —
+different physical delays in each direction. Unmanaged switches are the
+common cause. PTP assumes the two directions are symmetric and splits the
+round‑trip in half, so an asymmetric path appears as a fixed bias.
+
+Measure the mean offset with `ntpq -pn` or `chronyc sources` over an hour of
+quiet operation, then calibrate with `time2` in the refclock line:
 
 ```
-# Direction is PHC → SHM
-ps auxww | grep phc2sys | grep -v grep
+refclock shm unit 2 refid PTP time2 0.000180    # +180 µs example
+```
 
-# SHM(2) is being written with small offsets
+Use half the observed one‑way bias as the `time2` value. Better: replace the
+unmanaged switch with a PTP transparent clock or run a direct cable.
+
+
+## Client verification
+
+```bash
+# Exactly one ptp4l and one phc2sys:
+ps auxww | grep -E '[p]tp4l|[p]hc2sys'
+
+# ptp4l should be SLAVE with small master offsets:
+journalctl -u ptp4l@eth0.service -n 30 --no-pager
+
+# Client PHC should also be ~37 s ahead of UTC (it's slaved to the GM's PHC):
+sudo phc_ctl /dev/ptp0 cmp
+
+# SHM is ticking:
 sudo ntpshmmon -c 10
 
-# ntpsec sees PTP as a low-jitter refclock
+# ntpsec has adopted PTP as its system peer:
 ntpq -pn
+```
 
-# Coalescence is tuned (same as server!)
-sudo ethtool -c eth0 | grep usecs
+Healthy `ptp4l` log lines look like:
+
+```
+port 1 (eth0): UNCALIBRATED to SLAVE on MASTER_CLOCK_SELECTED
+master offset          -38 s2 freq   -2374 path delay       8123
+master offset          -12 s2 freq   -2369 path delay       8120
+```
+
+`s2` = servo state locked. Offsets of a few tens of ns to low µs on a direct
+cable, tens of µs through a switch, are normal.
+
+
+## Troubleshooting
+
+### `ioctl SIOCSHWTSTAMP failed: Invalid argument` at boot
+
+Four common causes, roughly in order:
+
+1. **Interface not up yet.** The ptp4l drop‑in above
+   (`After=network-online.target`, `Restart=on-failure`, `RestartSec=2s`)
+   addresses this.
+2. **NIC can't do HW timestamping at all.** `ethtool -T eth0` will show no
+   filters or `PTP Hardware Clock: none`. Switch to `time_stamping software`.
+3. **Transport/filter mismatch.** `network_transport L2` but the driver only
+   advertises UDP filters, or vice versa. Read `ethtool -T` carefully and
+   match.
+4. **Second `ptp4l` running.** See next item — this is the surprise.
+
+### TX timestamp timeouts on hardware that used to work
+
+Symptoms: `timed out while polling for tx timestamp`, port flaps between
+LISTENING and UNCALIBRATED, never converges. If `tx_timestamp_timeout 100` is
+already set and the issue is new on previously‑working hardware, check for a
+**duplicate daemon**:
+
+```bash
+ps auxww | grep '[p]tp4l'
+```
+
+Two processes = two daemons racing for the same PHC and socket. The usual
+cause is a leftover non‑templated unit from an older `linuxptp` version
+(pre‑4.0 shipped `/usr/lib/systemd/system/ptp4l.service`, modern only ships
+`ptp4l@.service`). To find stray references across the whole systemd tree:
+
+```bash
+sudo grep -rH 'ptp4l\.service\|phc2sys\.service' \
+    /etc/systemd /run/systemd /usr/lib/systemd 2>/dev/null | grep -v '@'
+```
+
+On a clean modern Debian system the **only** expected hit is
+`timemaster.service: Conflicts=... ptp4l.service ...` in the vendor unit file —
+a harmless no‑op because the referenced unit doesn't exist. Anything else is a
+leftover to investigate:
+
+- A non‑templated `ptp4l.service` or `phc2sys.service` under
+  `/usr/lib/systemd/system/` that `dpkg -S` reports as unowned — delete it.
+- Full replacement units under `/etc/systemd/system/` that shadow vendor
+  packages (`ntpd.service`, `gpsd.service` are common victims) —
+  `systemctl revert <unit>` then recreate as drop‑ins.
+
+Confirm package‑owned files haven't been hand‑edited:
+
+```bash
+dpkg -V linuxptp
+```
+
+The only expected flag is `??5?????? c /etc/linuxptp/ptp4l.conf` (your config,
+marked as a conffile). Anything else in the output means a package file has
+been modified in place.
+
+### `Unit ptp4l.service not found` when starting phc2sys
+
+The vendor `phc2sys@.service` has `Requires=ptp4l.service` (non‑templated)
+which on modern Debian doesn't exist. Until
+[Debian #linuxptp](https://bugs.debian.org/cgi-bin/pkgreport.cgi?package=linuxptp)
+gets a fix, the drop‑in above works around it. If it still fails after adding
+the drop‑in:
+
+```bash
+systemctl cat phc2sys@eth0.service
+```
+
+Look at the merged `Requires=` and `After=` lines. If either still mentions
+bare `ptp4l.service`, the reset (empty `Requires=`) didn't take. Common causes:
+reset placed after the new value (it wipes both), typo in the directive name,
+or `daemon-reload` not run.
+
+### Drop‑in file rules cheat sheet
+
+- A drop‑in is a **patch**, not a replacement. Include only what differs from
+  the vendor unit.
+- List‑valued keys (`ExecStart=`, `Requires=`, `After=`, `Wants=`,
+  `Environment=`, `ExecStartPre=`, …) **append** in drop‑ins. To replace,
+  first write an empty `Key=` then the new value. Order is critical: reset
+  first, then assign.
+- `[Install]` sections in drop‑ins are ignored. Enable/disable is done via
+  `systemctl enable/disable`.
+- Always verify with `systemctl cat <unit>` (merged view) after editing, and
+  `systemd-analyze verify <unit>` to catch syntax problems before trying to
+  start.
+- Never edit files under `/usr/lib/systemd/system/` or `/lib/systemd/system/`
+  directly — they get overwritten on package upgrades. Use
+  `systemctl edit <unit>` (instance drop‑in) or
+  `systemctl edit <template>@.service` (template‑level drop‑in).
+
+### Clients off by exactly 37 seconds
+
+Almost always a UTC↔TAI handling bug:
+
+- Server's `ntpsec` has no leapfile configured → kernel TAI offset is 0 →
+  `phc2sys -w` copies UTC to PHC without offset → `ptp4l` advertises a PHC
+  that's TAI‑labeled but UTC‑valued.
+- Or someone put `ntpshm` as a servo inside `ptp4l.conf` instead of routing
+  SHM through `phc2sys -E ntpshm`. The two don't apply the offset the same way.
+
+Check the server:
+
+```bash
+sudo phc_ctl /dev/ptp0 cmp       # should be ~+37 s
+sudo pmc -u -b 0 "GET TIME_PROPERTIES_DATA_SET"   # currentUtcOffset 37
+cat /etc/ntpsec/ntp.conf | grep leapfile
 ```
 
 
-## Yet unsolved: Enable the reverse correction direction in case GNSS reception fails; this is currently not possible as `phc2sys` can't switch servos on the fly:
-`ptp4l` does NOT dynamically demote `clockClass` when the GNSS signal is lost. If your GPS fails, the server continues advertising `clockClass 6` with a free-running crystal, misleading clients into trusting bad time. For production use, consider a watchdog that stops `ptp4l@eth0.service` when gpsd reports loss of lock (via `gpspipe -w` or similar).
+## Known limitations
+
+**No automatic clockClass demotion on GNSS loss.** If the server loses GPS
+lock, `ptp4l` continues advertising `clockClass 6` while its PHC runs free off
+the crystal. Clients keep trusting it. A production setup needs an external
+watchdog that monitors `gpsd` (e.g. via `gpspipe -w`) and, on sustained loss
+of fix, either stops `ptp4l@eth0.service` or rewrites `ptp4l.conf` with
+`clockClass 7` (holdover) or `clockClass 52` (degraded) and reloads.
+
+`phc2sys` can't hot‑swap direction either, so a single‑box bidirectional
+fallback (become a client when GPS is lost) isn't possible with the current
+tooling — it needs orchestration on top.
+
+
+## License
+
+This documentation: CC0 / public domain. Use, modify, and redistribute
+without restriction.
