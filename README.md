@@ -137,12 +137,14 @@ On the server, which has a highly precise time from its GNSS and PPS connection 
 
 ```
 [global]
-summary_interval 10  # syslog only every 1024 seconds
+summary_interval        10
+# syslog only every 1024 seconds
 
-clockClass 255       # means slave-only. Without this,
-                     # the client could theoretically advertise itself as a potential
-                     # grandmaster to other PTP nodes, which is almost never what you want.
-                     # Equivalent: add `-s` to ptp4l's command line.
+clockClass              255
+# means slave-only. Without this,
+# the client could theoretically advertise itself as a potential
+# grandmaster to other PTP nodes, which is almost never what you want.
+# Equivalent: add `-s` to ptp4l's command line.
 
 # use one of the following values for clock accuracy:
 # 0x20 25ns    0x24 2.5us    0x28 250us    0x2c 25ms    0x30 10s
@@ -151,8 +153,10 @@ clockClass 255       # means slave-only. Without this,
 # 0x23 1us     0x27 100us    0x2b 10ms     0x2f 1s
 clockAccuracy           0x23
 
-clock_servo linreg   # linear regression (do _not_ use ntpshm here!)
-free_running            1 # do NOT let PTP steer our system clock
+clock_servo             linreg
+# linear regression (do _not_ use ntpshm here!)
+free_running            1
+# do NOT let PTP steer our system clock
 
 # use one of the following for time source:
 # 0x10 atomic clock  0x30 terrestrial radio  0x50 NTP       0x90 other
@@ -243,19 +247,25 @@ On the client, create a new file `/etc/linuxptp/ptp4l.conf` just with just this:
 
 ```
 [global]
-summary_interval 10  # syslog only every 1024 seconds
-clockClass 255       # means slave-only. Without this,
-                     # the client could theoretically advertise itself as a potential
-                     # grandmaster to other PTP nodes, which is almost never what you want.
-                     # Equivalent: add `-s` to ptp4l's command line.
-clock_servo linreg   # linear regression (do _not_ use ntpshm here!)
+summary_interval 10
+# syslog only every 1024 seconds
+
+clockClass 255
+# means slave-only. Without this,
+# the client could theoretically advertise itself as a potential
+# grandmaster to other PTP nodes, which is almost never what you want.
+# Equivalent: add `-s` to ptp4l's command line.
+
+clock_servo linreg
+# linear regression (do _not_ use ntpshm here!)
 
 [eth0]
-delay_mechanism Auto # This defaults to E2E unless a P2P peer is detected. If there are
-                     # PTP-unaware switches between server and client, E2E suffers from
-                     # asymmetric queueing delay, which appears as a fixed offset.
-                     # For best results: direct cable between server and clients, or
-                     # use a PTP-aware (boundary or transparent clock) switch.
+delay_mechanism Auto
+# This defaults to E2E unless a P2P peer is detected. If there are
+# PTP-unaware switches between server and client, E2E suffers from
+# asymmetric queueing delay, which appears as a fixed offset.
+# For best results: direct cable between server and clients, or
+# use a PTP-aware (boundary or transparent clock) switch.
 ```
 
 Again, follow https://salsa.debian.org/multimedia-team/linuxptp/-/blob/master/debian/README.Debian?ref_type=heads :
@@ -291,7 +301,7 @@ Type=simple
 # -E ntpshm feeds SHM segment 2 for ntpsec to consume as a refclock.
 # -M 2 selects SHM segment 2.
 # -w waits for the system clock to be sane before starting.
-ExecStart=/usr/sbin/phc2sys -a -rr -E ntpshm -M 2 -w
+ExecStart=/usr/sbin/phc2sys -s eth0 -E ntpshm -M 2 -w
 
 [Install]
 WantedBy=multi-user.target
