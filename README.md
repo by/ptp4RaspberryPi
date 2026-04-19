@@ -160,7 +160,7 @@ free_running            1 # do NOT let PTP steer our system clock
 timeSource              0x20
 
 [eth0]
-#delay_mechanism Auto
+delay_mechanism Auto
 network_transport       L2
 ```
 
