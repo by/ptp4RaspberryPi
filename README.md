@@ -275,7 +275,7 @@ delay_mechanism         Auto
 # For best results: direct cable between server and clients, or
 # use a PTP-aware (boundary or transparent clock) switch.
 
- use one of the following for time source:
+# use one of the following for time source:
 # 0x10 atomic clock  0x30 terrestrial radio  0x50 NTP       0x90 other
 # 0x20 GPS           0x40 PTP                0x60 hand set  0xa0 int. oscillator
 timeSource             0x40
