@@ -422,21 +422,6 @@ RestartSec=2s
 sudo systemctl enable --now ptp4l@eth0.service
 ```
 
-### phc2sys config for SHM feed
-
-`phc2sys` needs to know which SHM segment to write. There's no command‑line
-flag for this; it comes from a config file. Create
-`/etc/linuxptp/phc2sys.conf`:
-
-```ini
-[global]
-ntpshm_segment          2
-```
-
-(Why a separate file? Passing `-f /etc/linuxptp/ptp4l.conf` also works —
-`phc2sys` ignores `ptp4l`‑specific options — but a dedicated file is clearer
-and avoids surprises if you tighten `ptp4l.conf` later.)
-
 ### phc2sys systemd unit (client direction)
 
 Same vendor-unit problem as on the server: the shipped `phc2sys@.service` has
@@ -457,18 +442,31 @@ After=ntpsec.service ptp4l@%i.service
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/phc2sys -s %I -E ntpshm -f /etc/linuxptp/phc2sys.conf -q
+ExecStart=/usr/sbin/phc2sys -s %I -E ntpshm -M 2 -w -q
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 - `-s %I` — source is the interface's PHC.
-- `-E ntpshm` — servo writes to SHM instead of steering a local clock. Target
-  selected by the config file's `ntpshm_segment`.
+- `-E ntpshm` — servo writes to an NTP SHM segment instead of steering a local
+  clock. (The `-h` help text lists only `pi` and `linreg`, but `ntpshm` and
+  `nullf` are also valid.)
+- `-M 2` — use SHM segment 2. Must match the `unit 2` in `ntp.conf`.
+- `-w` — wait for `ptp4l` to lock, then inherit the UTC↔TAI offset from it.
+  Without this (or `-O <offset>`), phc2sys refuses to start with *time offset
+  must be specified using -w or -O*. `-w` is the better choice because the
+  offset tracks any future leap-second changes automatically.
 - No `Before=time-sync.target` here — on the client, `ntpsec` is the authority;
   we don't want to signal "time is synced" before `ntpsec` has actually locked
   onto the SHM refclock.
+
+Why not `-a` (automatic mode)? `-a` has phc2sys query ptp4l's management
+interface and dynamically follow whichever port ptp4l has selected as slave —
+useful for boundary-clock hosts with multiple PTP ports that can fail over.
+For a single-NIC client feeding ntpsec, there's nothing dynamic to follow, so
+the simpler `-s %I -E ntpshm -M N -w` form is canonical and matches the
+examples in the Red Hat, Fedora, and linuxptp documentation.
 
 ```bash
 sudo systemctl enable --now phc2sys@eth0.service
