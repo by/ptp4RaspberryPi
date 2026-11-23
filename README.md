@@ -30,7 +30,14 @@ Thanks to `@tiagofreire-pt` and the `linuxptp-devel` contributors.
 - **Time source on server**: GNSS + PPS, disciplining `ntpsec`.
 - **Server role**: PTP grandmaster, clockClass 6.
 - **Client role**: PTP client, consuming time via `phc2sys -E ntpshm` and
-  feeding it to `ntpsec` as a refclock.
+  feeding it to `ntpsec` as a refclock — or, with an `ntpsec` that has the
+  PHC refclock driver, reading the PHC directly (see
+  [Option B](#option-b-ntpsec-phc-refclock)).
+- **Service names**: Debian's `ntpsec` package runs `ntpsec.service`; an
+  `ntpsec` built from source and installed with `./waf install` runs
+  `ntpd.service` and ships `ntp-wait.service`. The units below list both
+  names where it matters — ordering against a unit that doesn't exist is
+  silently ignored, so listing both is harmless.
 
 
 ## Architecture
@@ -60,10 +67,19 @@ Client:                                                    network
 
 Why `phc2sys` in both directions? `ntpsec` (and `ntpd`) do not discipline the
 NIC's PHC. `phc2sys` is the bridge that moves time between the system clock
-and the PHC, and it's also the only component that correctly applies the
-UTC↔TAI offset when it crosses that boundary. Doing this inside `ptp4l.conf`
-(`ntpshm` as a servo there) uses subtly different semantics and silently
-produces 37‑second errors on clients.
+and the PHC, and it applies the UTC↔TAI offset when it crosses that
+boundary. Doing this inside `ptp4l.conf` (`ntpshm` as a servo there) uses
+subtly different semantics and silently produces 37‑second errors on
+clients. (On the client side, an `ntpsec` with the PHC refclock driver can
+replace `phc2sys -E ntpshm` and the SHM hop; see
+[Option B](#option-b-ntpsec-phc-refclock).)
+
+Where does the 37 s come from? `phc2sys -w` takes it from `ptp4l`'s
+`currentUtcOffset` — on the grandmaster that is `ptp4l`'s own setting, not
+the kernel or `ntpsec`: `ptp4l`'s `utc_offset` setting (default 37). Out of
+the box `ptp4l` announces it with `currentUtcOffsetValid 0`, never changes
+it after a leap second, and never announces one (see
+[Known limitations](#known-limitations)).
 
 
 ## Prerequisites
@@ -115,9 +131,10 @@ good hygiene — commands later in the document use this path.
 
 ### Configure the leap‑seconds file for ntpsec (server)
 
-The server's `phc2sys` needs to know the current UTC↔TAI offset (37 s) in order
-to feed the PHC in TAI. It picks this up from the kernel's TAI offset, which
-`ntpsec` sets — but only if `ntpsec` has been given a leap‑seconds file.
+`ntpsec` needs the leap‑seconds file to handle leap seconds itself and to
+set the kernel's TAI offset; the PHC refclock (`flag1`) reads the same
+file. (The server's `phc2sys -w` does *not* use it: it takes the
+offset from `ptp4l`, see [Architecture](#architecture).)
 
 The file ships with the base `tzdata` package at
 `/usr/share/zoneinfo/leap-seconds.list` — no extra package install needed. Just
@@ -132,9 +149,6 @@ Then:
 ```bash
 sudo systemctl restart ntpsec
 ```
-
-Without this, `phc2sys -w` on the server will happily copy UTC time into the
-PHC without offset, and every client will be 37 seconds off.
 
 Note: `leap-seconds.list` has an expiration date (re‑issued semi‑annually by
 IERS). Debian ships updated `tzdata` packages as new IERS bulletins are
@@ -240,9 +254,18 @@ delay_mechanism         Auto
 
 # Hardware timestamping (default, but explicit is better).
 time_stamping           hardware
+
+# --- Raspberry Pi CM4/CM5/Pi5 quirks (same as on the clients) --------------
+# The grandmaster hardware-timestamps every Sync it sends, so the slow TX
+# timestamp path bites here at least as much as on a client.
+tx_timestamp_timeout    100
+ptp_minor_version       0
 ```
 
 Note: no `ntpshm_segment` here — the server does not feed SHM, only clients do.
+
+`clockClass`, `clockAccuracy`, `timeSource` and `utc_offset` (default 37)
+are fixed at startup; see [Known limitations](#known-limitations).
 
 ### ptp4l systemd unit
 
@@ -253,9 +276,16 @@ against PHY initialization and produce
 `ioctl SIOCSHWTSTAMP failed: Invalid argument` at boot
 (Debian bug [#1070847](https://bugs.debian.org/1070847)).
 
-Fix via a drop‑in, **not** by editing the vendor file:
+On the grandmaster there is a second, more important rule: **`ptp4l` must
+not start before the system clock is right.** Otherwise it announces
+clockClass 6 for a clock that is still being set, and `phc2sys` copies that
+clock into the PHC. So `ptp4l` waits for `ntp-wait` (ntpd synchronized) and
+then, up to 30 minutes, until ntpd has selected PPS.
+
+Fix both via a drop‑in, **not** by editing the vendor file:
 
 ```bash
+sudo systemctl enable ntp-wait.service   # ships with ntpsec; see note below
 sudo systemctl edit ptp4l@eth0.service
 ```
 
@@ -263,13 +293,29 @@ Add only:
 
 ```ini
 [Unit]
-After=network-online.target
-Wants=network-online.target
+After=network-online.target ntp-wait.service
+Wants=network-online.target ntp-wait.service
 
 [Service]
 Restart=on-failure
 RestartSec=2s
+# Wait (max 30 min) until ntpd has selected PPS, then start anyway.
+TimeoutStartSec=35min
+ExecStartPre=-/usr/bin/timeout 30m /bin/sh -c 'until /usr/local/bin/ntpq -c "rv 0 refid" | grep -q "refid=kPPS"; do sleep 5; done'
 ```
+
+- Check the refid string once PPS is selected: `ntpq -c "rv 0 refid"` must
+  print exactly what the `grep` looks for (here `refid=kPPS`, from
+  `refid kPPS` on the PPS refclock line). Adjust the `ntpq` path
+  (`/usr/bin/ntpq` for Debian's package).
+- `ExecStartPre` counts against the start timeout, hence `TimeoutStartSec`.
+  The leading `-` lets `ptp4l` start anyway after the 30 minutes.
+- `ntp-wait.service` is the unit shipped by an `ntpsec` built from source.
+  Check `systemctl list-unit-files | grep -i wait` for the name on your
+  system.
+- With `minpoll 10` on the PPS refclock, the first PPS sample can take ~17
+  minutes after ntpd synchronizes. `minpoll 4 maxpoll 4` on the PPS line
+  shortens the wait to about a minute.
 
 Enable and start:
 
@@ -307,7 +353,7 @@ Replace the entire content with:
 Description=Synchronize system clock or PTP hardware clock (PHC) for %I
 Documentation=man:phc2sys
 Requires=ptp4l@%i.service
-After=ntpsec.service ptp4l@%i.service
+After=ntp-wait.service ntpd.service ntpsec.service ptp4l@%i.service
 Before=time-sync.target
 
 [Service]
@@ -319,9 +365,17 @@ WantedBy=multi-user.target
 ```
 
 Key changes from the vendor: the bare `ptp4l.service` references are replaced
-with the templated `ptp4l@%i.service`; `ntpsec.service` is added to `After=` so
-that the system clock is disciplined before we start copying it to the PHC;
-and `ExecStart=` switches to server direction (`-s CLOCK_REALTIME -c %I`).
+with the templated `ptp4l@%i.service`; `ntp-wait.service` (and the ntpd unit
+under either name) is added to `After=` so that the system clock is
+disciplined before we start copying it to the PHC; and `ExecStart=` switches
+to server direction (`-s CLOCK_REALTIME -c %I`). Note that
+`After=ntpsec.service` alone only waits for ntpd to *start*, not to
+synchronize — and does nothing at all where the unit is called `ntpd.service`.
+
+Make sure there is no per-instance copy
+`/etc/systemd/system/phc2sys@eth0.service`: it would silently override this
+template for eth0 (`systemctl cat phc2sys@eth0.service | head -1` must show
+`phc2sys@.service`).
 
 The cost of `--full` is that the override is a full local copy of the unit
 rather than a patch — future upstream improvements won't flow in
@@ -336,6 +390,63 @@ sudo systemctl enable --now phc2sys@eth0.service
 systemctl status phc2sys@eth0.service
 ```
 
+### Boot ordering pitfalls
+
+With `ptp4l` waiting for ntpd to synchronize, **nothing that ntpd needs in
+order to synchronize may be ordered after `ptp4l` or `ntp-wait`.** Leftover
+`After=ptp4l@eth0.service` lines from an older setup create loops:
+
+- in an ntpd drop-in → systemd reports an *ordering cycle* and silently
+  drops the `ntp-wait` job (nothing waits any more);
+- in gpsd's drop-in, or in a unit gpsd `Requires=`/`BindsTo=` (an NTRIP
+  relay, for instance) → no cycle is reported, but boot **hangs** until
+  `ntp-wait` times out (`ntpwait -n 30000 -s 1`, about 8 hours), because
+  ntpd cannot synchronize without gpsd.
+
+The intended order is: GNSS chain (gpsd and what it needs) and ntpd →
+`ntp-wait` → `ptp4l` (waits for PPS) → `phc2sys`.
+Check before rebooting:
+
+```bash
+# must print nothing:
+systemctl show ntpd.service ntpsec.service gpsd.service -p After \
+    | tr ' ' '\n' | grep -E "ntp-wait|ptp4l"
+# no "ordering cycle" lines:
+systemd-analyze verify ntpd.service gpsd.service ptp4l@eth0.service phc2sys@eth0.service
+```
+
+and after a reboot:
+
+```bash
+journalctl -b -o short-precise \
+    | grep -E "Started (gpsd|ptp4l|phc2sys)|ntpd\[.*Starting|Finished ntp-wait"
+```
+
+If a service that gpsd depends on needs correct time (e.g. TLS to an NTRIP
+caster), give it `Restart=on-failure` instead of ordering it after
+`ntp-wait`.
+
+### Optional: watch the PHC from ntpsec
+
+With an `ntpsec` that has the PHC refclock driver, ntpd can continuously
+measure the whole system clock → `phc2sys` → PHC (TAI) chain. On the
+grandmaster this must be **`noselect`** — the PHC is fed *from* the system
+clock, so selecting it would make ntpd and `phc2sys` steer each other:
+
+```
+refclock phc path eth0 flag1 1 flag4 1 minpoll 4 maxpoll 4 refid PTP noselect
+```
+
+`ntpq -p` then shows the PHC's offset from the system clock (expect well
+under a microsecond once `phc2sys` has locked; ±37 s means a UTC/TAI
+mismatch). Until `phc2sys` runs after boot, the PHC is still on UTC and
+reads −37 s; ntpd's jitter for this line stays large for a few polls after
+`phc2sys` steps the PHC. Both are expected and harmless with `noselect`.
+
+Likewise, if any of your PTP clients also serve NTP (refid `.PTP.`), mark
+them `noselect` in the grandmaster's `ntp.conf`: they get their time from
+this grandmaster, and ntpd's loop detection doesn't catch that.
+
 ### Server verification
 
 ```bash
@@ -345,8 +456,9 @@ ps auxww | grep -E '[p]tp4l|[p]hc2sys'
 # PHC should be ~37 s ahead of UTC (i.e. TAI):
 sudo phc_ctl /dev/ptp0 cmp
 
-# ptp4l is advertising the current UTC offset and the right clockClass:
-sudo pmc -u -b 0 "GET TIME_PROPERTIES_DATA_SET"      # currentUtcOffset 37, currentUtcOffsetValid 1
+# ptp4l is advertising the current UTC offset and the right clockClass
+# (currentUtcOffsetValid is 0 out of the box, see Known limitations):
+sudo pmc -u -b 0 "GET TIME_PROPERTIES_DATA_SET"      # currentUtcOffset 37, ptpTimescale 1
 sudo pmc -u -b 0 "GET PARENT_DATA_SET"               # grandmasterClockClass 6
 
 # ntpsec is in charge of system time:
@@ -422,7 +534,13 @@ RestartSec=2s
 sudo systemctl enable --now ptp4l@eth0.service
 ```
 
-### phc2sys systemd unit (client direction)
+### Option A: phc2sys → SHM → ntpsec
+
+This works with any `ntpsec`. If yours has the PHC refclock driver, see
+[Option B](#option-b-ntpsec-phc-refclock), which needs neither `phc2sys`
+nor SHM on the client.
+
+#### phc2sys systemd unit (client direction)
 
 Same vendor-unit problem as on the server: the shipped `phc2sys@.service` has
 non-removable `Requires=ptp4l.service` / `After=ptp4l.service` that won't
@@ -438,7 +556,7 @@ sudo systemctl edit --full phc2sys@.service
 Description=Synchronize system clock or PTP hardware clock (PHC) for %I
 Documentation=man:phc2sys
 Requires=ptp4l@%i.service
-After=ntpsec.service ptp4l@%i.service
+After=ntpd.service ntpsec.service ptp4l@%i.service
 
 [Service]
 Type=simple
@@ -472,7 +590,7 @@ examples in the Red Hat, Fedora, and linuxptp documentation.
 sudo systemctl enable --now phc2sys@eth0.service
 ```
 
-### ntpsec refclock
+#### ntpsec refclock
 
 In `/etc/ntpsec/ntp.conf`, add:
 
@@ -496,6 +614,38 @@ ntpq -pn                   # refid=PTP should eventually get '*' (system peer)
 `ntpq -pn` can take a few minutes to promote the PTP refclock to system peer
 as `ntpsec` collects enough samples to trust it.
 
+### Option B: ntpsec PHC refclock
+
+An `ntpsec` built with the PHC refclock driver (`refclock phc`, driver 47)
+reads the client's PHC directly: no `phc2sys`, no SHM segment, no
+37‑second handling outside ntpd. Keep `ptp4l` exactly as above — it is what
+locks the client PHC to the grandmaster — and:
+
+```bash
+sudo systemctl disable --now phc2sys@eth0.service
+```
+
+In `ntp.conf`:
+
+```
+leapfile /usr/share/zoneinfo/leap-seconds.list
+refclock phc path eth0 flag1 1 refid PTP prefer
+```
+
+- `path eth0` picks the PHC of that interface (or give `/dev/ptp0`).
+- `flag1 1`: the PHC runs on TAI; the driver subtracts the TAI−UTC offset
+  from the leap‑seconds file (required — without it the samples are
+  discarded). It uses the client's own file, not the grandmaster's
+  announced offset, so keep `tzdata` current.
+- Each second the driver takes a burst of up to 25 PHC readings and
+  averages the ones with the shortest read latency; it uses hardware
+  cross‑timestamping when the NIC offers it. The startup log line
+  `PHC(0): using /dev/ptpN via …` shows which method was found.
+- The `ntpshm_segment` line in the client's `ptp4l.conf` is no longer needed.
+
+The driver cannot tell whether `ptp4l` is locked; neither can the SHM
+path. Watch `ptp4l`'s log, or `pmc -u -b 0 "GET TIME_STATUS_NP"`.
+
 ### Calibrating path asymmetry
 
 A stable residual offset (typically tens to hundreds of µs) between client and
@@ -504,15 +654,34 @@ different physical delays in each direction. Unmanaged switches are the
 common cause. PTP assumes the two directions are symmetric and splits the
 round‑trip in half, so an asymmetric path appears as a fixed bias.
 
-Measure the mean offset with `ntpq -pn` or `chronyc sources` over an hour of
-quiet operation, then calibrate with `time2` in the refclock line:
+Measure the mean offset of the PTP refclock against an independent
+reference (a GNSS/PPS source on the client, or the grandmaster itself) over
+an hour of quiet operation. The bias you see *is* the error PTP made —
+half of the path asymmetry — so correct it in full, not by half.
+
+Preferably correct it in `ptp4l` on the client, so the PHC itself (and
+everything downstream) is right. `delayAsymmetry` is in nanoseconds and,
+per `ptp4l(8)`, positive when the master‑to‑slave path is the slower one.
+Sign conventions are easy to get backwards, so set it to the measured bias,
+restart `ptp4l`, and check: if the bias doubled, flip the sign; if it only
+halved, double the value:
+
+```ini
+# client ptp4l.conf, [global] or the port section
+delayAsymmetry          180000      # example: 180 µs
+```
+
+Alternatively correct it in ntpsec with `time1` — **not** `time2`: for the
+SHM driver `time2` is a sanity limit, and values below 1 s are ignored, so
+`time2 0.000180` has no effect. `time1` is added to every sample, so use the
+opposite sign of the measured offset:
 
 ```
-refclock shm unit 2 refid PTP time2 0.000180    # +180 µs example
+refclock shm unit 2 refid PTP time1 -0.000180    # offset was +180 µs
 ```
 
-Use half the observed one‑way bias as the `time2` value. Better: replace the
-unmanaged switch with a PTP transparent clock or run a direct cable.
+(Same for `refclock phc`.) Better still: replace the unmanaged switch with
+a PTP transparent clock or run a direct cable.
 
 
 ## Client verification
@@ -672,29 +841,40 @@ and not the vendor file.
 
 Almost always a UTC↔TAI handling bug:
 
-- Server's `ntpsec` has no leapfile configured → kernel TAI offset is 0 →
-  `phc2sys -w` copies UTC to PHC without offset → `ptp4l` advertises a PHC
-  that's TAI‑labeled but UTC‑valued.
-- Or someone put `ntpshm` as a servo inside `ptp4l.conf` instead of routing
+- The grandmaster's `ptp4l` announces the wrong `currentUtcOffset` (check
+  `GET TIME_PROPERTIES_DATA_SET` below). `phc2sys -w` on the server applies
+  whatever `ptp4l` says, and the clients' `phc2sys -w` takes it from the
+  announce messages. It comes from `utc_offset` in the server's `ptp4l.conf`.
+- Client with the PHC refclock (Option B): `flag1 1` missing. (A missing
+  leapfile doesn't cause 37 s — the driver then discards the samples and
+  logs a warning.)
+- Someone put `ntpshm` as a servo inside `ptp4l.conf` instead of routing
   SHM through `phc2sys -E ntpshm`. The two don't apply the offset the same way.
+- Only right after the grandmaster boots: its PHC is still on UTC until
+  `phc2sys` runs. With the boot ordering above, `ptp4l` isn't announcing
+  yet at that point.
 
 Check the server:
 
 ```bash
 sudo phc_ctl /dev/ptp0 cmp       # should be ~+37 s
 sudo pmc -u -b 0 "GET TIME_PROPERTIES_DATA_SET"   # currentUtcOffset 37
-cat /etc/ntpsec/ntp.conf | grep leapfile
+grep leapfile /etc/ntpsec/ntp.conf /etc/ntp.conf 2>/dev/null
 ```
 
 
 ## Known limitations
 
-**No automatic clockClass demotion on GNSS loss.** If the server loses GPS
-lock, `ptp4l` continues advertising `clockClass 6` while its PHC runs free off
-the crystal. Clients keep trusting it. A production setup needs an external
-watchdog that monitors `gpsd` (e.g. via `gpspipe -w`) and, on sustained loss
-of fix, either stops `ptp4l@eth0.service` or rewrites `ptp4l.conf` with
-`clockClass 7` (holdover) or `clockClass 52` (degraded) and reloads.
+**No automatic clockClass demotion or leap-second announcement.** `ptp4l`'s
+`clockClass`, `timeSource` and `utc_offset` are fixed at startup, and it
+announces `currentUtcOffsetValid 0`. If the server loses GPS lock, it keeps
+advertising clockClass 6 while its PHC runs free off the crystal, and it
+never announces a leap second (after one, `utc_offset` must be raised by
+hand). The only runtime way to change these is
+`pmc -u -b 0 "SET GRANDMASTER_SETTINGS_NP ..."`, driven by an external
+watchdog that follows ntpd (e.g. `ntpq -c "rv 0 refid"`) and the
+leap‑seconds file. On the clients, `clock_class_threshold` in `ptp4l.conf`
+limits which clockClass they accept as locked.
 
 `phc2sys` can't hot‑swap direction either, so a single‑box bidirectional
 fallback (become a client when GPS is lost) isn't possible with the current
