@@ -500,18 +500,6 @@ time_stamping           hardware
 
 # Time source: 0x40 PTP (we receive time from a PTP grandmaster).
 timeSource              0x40
-
-# --- Raspberry Pi CM4/CM5/Pi5 quirks ---------------------------------------
-# The macb/bcmgenet driver is slow to return TX timestamps. The default
-# tx_timestamp_timeout of 1 ms causes "timed out while polling for tx timestamp"
-# followed by FAULT_DETECTED, which in this configuration loops forever.
-# 100 ms is plenty of margin on this hardware.
-tx_timestamp_timeout    100
-
-# The Pi Ethernet IP doesn't handle PTP 2.1 correctly. Pin the on-wire minor
-# version to 0 (PTP 2.0) for compatibility. Required on linuxptp 4.x with Pi
-# hardware; harmless to leave on linuxptp 3.x.
-ptp_minor_version       0
 ```
 
 ### ptp4l systemd unit
